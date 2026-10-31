@@ -1,13 +1,14 @@
 """Local-only web GUI and streaming, temporary-file-backed compression endpoint."""
 
 import argparse
+import errno
 import hmac
-import json
 import logging
+import os
 import secrets
+import socket
 import tempfile
 import threading
-import urllib.request
 import webbrowser
 from pathlib import Path
 from urllib.parse import quote
@@ -111,14 +112,26 @@ def create_app(config=None):
     return app
 
 
-def existing_app(url):
+def bind_local_socket(port):
+    """Bind once and pass the same socket to Waitress, avoiding port selection races."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        # Ignore configured proxies for this localhost health check.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(url + "/api/health", timeout=0.4) as response:
-            return json.loads(response.read(1024)).get("app") == APP_ID
-    except (OSError, ValueError):
-        return False
+        # Windows SO_REUSEADDR can allow multiple listeners on the same port.
+        if os.name == "nt":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE and not (
+                os.name == "nt" and exc.errno == errno.EACCES
+            ):
+                raise
+            # Port 0 asks the OS to select and atomically bind a free port.
+            sock.bind(("127.0.0.1", 0))
+        return sock
+    except BaseException:
+        sock.close()
+        raise
 
 
 def main():
@@ -126,25 +139,21 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
-    if not 1024 <= args.port <= 65516:
-        parser.error("port must be between 1024 and 65516")
+    if not 1024 <= args.port <= 65535:
+        parser.error("port must be between 1024 and 65535")
     app = create_app()
-    for port in range(args.port, args.port + 20):
-        url = f"http://127.0.0.1:{port}"
-        if existing_app(url):
-            print(f"Already running: {url}", flush=True)
-            if not args.no_browser:
-                webbrowser.open(url)
-            return
-        try:
-            server = create_server(app, host="127.0.0.1", port=port, threads=2,
-                                   max_request_body_size=app.config["MAX_CONTENT_LENGTH"] + 1024 * 1024,
-                                   channel_timeout=600)
-            break
-        except OSError:
-            continue
-    else:
-        raise SystemExit("No free local port. Close old instances or use --port 9000.")
+    sock = bind_local_socket(args.port)
+    port = sock.getsockname()[1]
+    try:
+        server = create_server(app, sockets=[sock], threads=2,
+                               max_request_body_size=app.config["MAX_CONTENT_LENGTH"] + 1024 * 1024,
+                               channel_timeout=600)
+    except BaseException:
+        sock.close()
+        raise
+    url = f"http://127.0.0.1:{port}"
+    if port != args.port:
+        print(f"Port {args.port} unavailable; using {port} instead.", flush=True)
     print(f"PDF compressor ready: {url}", flush=True)
     print("Keep this window open. Press Ctrl+C to stop.", flush=True)
     if not args.no_browser:
